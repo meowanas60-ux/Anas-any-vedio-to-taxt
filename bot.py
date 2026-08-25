@@ -5,7 +5,6 @@ import sqlite3
 import logging
 from datetime import datetime
 import yt_dlp
-from groq import Groq
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,7 +21,6 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # Configuration & Secrets
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 OWNER_ID = 7701549179
@@ -30,12 +28,8 @@ CHANNEL_1 = "@sahatanas"
 CHANNEL_2 = "@sahatanass"
 DB_FILE = "bot_data.db"
 
-# Concurrency Semaphore for RAM Safety (Max 1 heavy task at a time)
 SEMAPHORE = asyncio.Semaphore(1)
 
-# API Initialization
-if GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -173,13 +167,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"আপনার অ্যাকাউন্ট টাইপ: `{role.upper()}`\n\n"
         f"✨ **বটের সুবিধাসমূহ:**\n"
         f"📹 **Video Link / File:** ভিডিও বিশ্লেষণ, সামারি, ট্রানস্ক্রিপ্ট ও ট্যাগ তৈরি।\n"
-        f"🖼️ **Photo:** ছবিতে কী কী আছে তার নিখুঁত বিস্তারিত বিবরণ।\n\n"
+        f"🖼️ **Photo:** ছবিতে কী কী আছে তার নিখুঁত বিবরণ।\n\n"
         f"📩 যেকোনো ভিডিও লিংক, ফাইল বা ছবি পাঠান!",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
 
-# Admin Commands
 async def give_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -224,7 +217,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit = "Unlimited" if role == 'owner' else ("5/day" if role == 'vip' else "1/day")
         await query.message.reply_text(f"📊 **আপনার তথ্য:**\nID: `{user_id}`\nRole: `{role.upper()}`\nDaily Limit: `{limit}`", parse_mode="Markdown")
 
-# Photo Handler (Gemini Multi-modal)
+# Photo Handler
 async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_force_join(context.bot, user_id):
@@ -259,7 +252,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(temp_path)
         gc.collect()
 
-# Video Link & File Processing
+# Video Processing via Gemini Multi-modal Audio
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not await check_force_join(context.bot, user_id):
@@ -277,11 +270,12 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_title = "Uploaded Video"
         duration = "Unknown"
         resolution = "Unknown"
+        uploaded_gemini_file = None
 
         try:
             if update.message.text:
                 url = update.message.text.strip()
-                await status_msg.edit_text("📥 **ভিডিও থেকে অডিও এক্সট্র্যাক্ট করা হচ্ছে...**")
+                await status_msg.edit_text("📥 **ভিডিও থেকে অডিও প্রসেস করা হচ্ছে...**")
                 
                 ydl_opts = {
                     'format': 'bestaudio/best',
@@ -305,7 +299,6 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 temp_video = f"downloads/vid_{user_id}.mp4"
                 await file.download_to_drive(temp_video)
                 
-                # Extract audio using ffmpeg CLI directly
                 proc = await asyncio.create_subprocess_exec(
                     'ffmpeg', '-y', '-i', temp_video, '-vn', '-acodec', 'libmp3lame', '-b:a', '64k', audio_path
                 )
@@ -315,44 +308,41 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resolution = f"{update.message.video.height}p"
                 duration = f"{update.message.video.duration}s"
 
-            # 1. Groq Audio Transcription
-            await status_msg.edit_text("🎙️ **Groq Whisper AI দিয়ে ট্রান্সক্রিপ্ট করা হচ্ছে...**")
-            with open(audio_path, "rb") as file:
-                transcription = groq_client.audio.transcriptions.create(
-                    file=(audio_path, file.read()),
-                    model="whisper-large-v3-turbo",
-                    response_format="text",
-                )
+            # Gemini Audio Processing
+            await status_msg.edit_text("🧠 **Gemini AI দিয়ে ভিডিও বিশ্লেষণ ও রিপোর্ট তৈরি হচ্ছে...**")
+            
+            loop = asyncio.get_running_loop()
+            uploaded_gemini_file = await loop.run_in_executor(None, lambda: genai.upload_file(path=audio_path))
 
-            # 2. Gemini AI Analysis & Summarization
-            await status_msg.edit_text("🧠 **Gemini AI দিয়ে বিস্তারিত রিপোর্ট তৈরি হচ্ছে...**")
             prompt = f"""
-Analyze the following transcript of a video and provide a response in Bengali:
+Analyze the provided audio file from a video and output in Bengali:
 📌 Title: {video_title}
-📝 Summary: Provide a clear summary of what is discussed in the video.
-👤 Speaker & Speech: Who is speaking and what are the core statements?
+📝 Summary: Provide a detailed summary of what is spoken or presented.
+👤 Speaker & Speech Details: Key takeaways and speaker information.
 🏷️ Tags/Topics: Top 5 relevant hashtags/topics.
 🌍 Language: Main language detected.
-
-Transcript:
-{transcription}
+📜 Transcript Snippet: First few sentences transcribed.
 """
             model = genai.GenerativeModel('gemini-1.5-flash')
-            ai_response = model.generate_content(prompt)
+            ai_response = await loop.run_in_executor(None, lambda: model.generate_content([uploaded_gemini_file, prompt]))
 
             output_text = (
                 f"📌 **Title:** {video_title}\n"
                 f"⏱️ **Duration:** {duration} | 📺 **Resolution:** {resolution}\n\n"
-                f"{ai_response.text}\n\n"
-                f"📜 **Transcript (Short Snippet):**\n_{transcription[:300]}..._"
+                f"{ai_response.text}"
             )
 
             await status_msg.edit_text(output_text, parse_mode="Markdown")
 
         except Exception as e:
             logging.error(f"Processing error: {e}")
-            await status_msg.edit_text("❌ প্রসেস করতে ত্রুটি হয়েছে! অডিও সাইজ অনেক বড় অথবা লিংকটি ইনভ্যালিড।")
+            await status_msg.edit_text("❌ প্রসেস করতে ত্রুটি হয়েছে! অডিও ফাইল সাইজ অনেক বড় অথবা লিংকটি ইনভ্যালিড।")
         finally:
+            if uploaded_gemini_file:
+                try:
+                    genai.delete_file(uploaded_gemini_file.name)
+                except Exception:
+                    pass
             if os.path.exists(audio_path):
                 os.remove(audio_path)
             gc.collect()
@@ -375,7 +365,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, process_photo))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.VIDEO, process_video))
 
-    print("AI Analysis Bot is running...")
+    print("Gemini AI Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
